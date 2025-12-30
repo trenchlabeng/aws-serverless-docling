@@ -9,7 +9,8 @@ COPY docling/requirements.txt ${LAMBDA_TASK_ROOT}/
 
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-
+RUN pip uninstall -y opencv-python opencv-python-headless
+RUN pip install --no-cache-dir opencv-python-headless
 # Optional: Set Torch cache directory
 ENV TORCH_HOME=/tmp/torch
 

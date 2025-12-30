@@ -1,2 +1,7 @@
 requests
 docling
+docling[rapidocr]
+rapidocr
+onnxruntime
+rapidocr-onnxruntime
+tiktoken

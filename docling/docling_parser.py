@@ -15,7 +15,7 @@ from docling.datamodel.pipeline_options import (
     AcceleratorOptions,
     PdfPipelineOptions,
 )
-from docling.datamodel.pipeline_options import PipelineOptions
+from docling.datamodel.pipeline_options import PipelineOptions, EasyOcrOptions, TesseractOcrOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption, WordFormatOption
 from pydantic import BaseModel
 
@@ -101,9 +101,10 @@ class DoclingParser(DocumentDetector):
             case False:
                 if self.doc_type==".pdf":
                     pipeline_options = PdfPipelineOptions()
-                    pipeline_options.do_ocr = False
-                    pipeline_options.do_table_structure = False
-                    pipeline_options.table_structure_options.do_cell_matching = False
+                    pipeline_options.do_ocr = True
+                    pipeline_options.do_table_structure = True
+                    # pipeline_options.ocr_options = TesseractOcrOptions()  # Use Tesseract
+                    pipeline_options.table_structure_options.do_cell_matching = True
                     accelerator_options = AcceleratorOptions()
                     accelerator_options.device = AcceleratorDevice.CPU
                     accelerator_options.num_threads = 8
@@ -135,6 +136,7 @@ class DoclingParser(DocumentDetector):
                 if self.doc_type==".pdf":
                     pipeline_options = PdfPipelineOptions(do_ocr=True,
                                                           force_full_page_ocr=True,
+                                                        #   ocr_options = TesseractOcrOptions()
                                                           )
                     accelerator_options = AcceleratorOptions(num_threads=8,
                                                              device=AcceleratorDevice.CPU)
@@ -148,7 +150,7 @@ class DoclingParser(DocumentDetector):
                     )
                     return doc_converter
                 else:
-                    doc_converter = DocumentConverter( )
+                    doc_converter = DocumentConverter()
                     return doc_converter
 
     def _get_document_source(self) -> DocumentStream:
@@ -169,7 +171,7 @@ class DoclingParser(DocumentDetector):
                 case False:
                     result =conversion_result.document.export_to_dict()
                     results = " ".join([result_obj.get("text"," ") for result_obj in result.get('texts',[])])
-            return results
+            return conversion_result
         except Exception as e:
             logger.error(f"Error parsing document: {str(e)}")
             raise DocumentFormatError(f"Failed to parse document: {str(e)}")
