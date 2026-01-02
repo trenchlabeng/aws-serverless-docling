@@ -1,0 +1,10 @@
+# config.yaml
+model_list:
+  - model_name: nova-2-lite  # This is the alias your code will use
+    litellm_params:
+      model: us.amazon.nova-2-lite-v1:0 # The actual Bedrock model ID
+
+litellm_settings:
+  # This tells LiteLLM to use the boto3 library for authentication,
+  # which will automatically pick up your 'aws configure' credentials.
+  aws_bedrock_runtime_auth: true

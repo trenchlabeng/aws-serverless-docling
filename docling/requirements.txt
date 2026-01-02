@@ -1,7 +1,12 @@
-requests
-docling
-docling[rapidocr]
-rapidocr
-onnxruntime
-rapidocr-onnxruntime
-tiktoken
+# requests
+# docling
+# docling[rapidocr]
+# rapidocr
+# onnxruntime
+# rapidocr-onnxruntime
+# tiktoken
+# requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+docling 
+openai
+psycopg2-binary

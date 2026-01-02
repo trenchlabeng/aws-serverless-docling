@@ -9,11 +9,14 @@ COPY docling/requirements.txt ${LAMBDA_TASK_ROOT}/
 
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip uninstall -y opencv-python opencv-python-headless
-RUN pip install --no-cache-dir opencv-python-headless
+# RUN pip uninstall -y opencv-python opencv-python-headless
+# RUN pip install --no-cache-dir opencv-python-headless
 # Optional: Set Torch cache directory
 ENV TORCH_HOME=/tmp/torch
+ENV MODULE_PATH=/tmp
+ENV HF_HOME=/tmp/huggingface
 
+RUN docling-tools models download-hf-repo sentence-transformers/all-MiniLM-L6-v2
 # Copy the rest of the application code
 COPY docling/ ${LAMBDA_TASK_ROOT}/
 

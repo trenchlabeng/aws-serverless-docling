@@ -3,176 +3,242 @@ import os
 import boto3
 import traceback
 import logging
+import textwrap
 from urllib.parse import urlparse
-from docling_parser import DoclingParser
 from docling.chunking import HybridChunker
+from openai import OpenAI
+import re
+import psycopg2
 
-# Initialize Clients
+# IMPORTANT: This assumes your docling_parser.py has the VlmDocParser class
+from docling_parser import VlmDocParser
+
+# --- AWS CLIENTS AND CONFIGURATION ---
 s3_client = boto3.client('s3')
 sqs_client = boto3.client('sqs')
+secrets_client = boto3.client('secretsmanager')
 
-# Configuration
+# --- ENVIRONMENT VARIABLES ---
 SQS_QUEUE_URL = os.environ.get('SQS_QUEUE_URL')
-# Output prefix can be empty if you want the bucket root to start with case_id
-OUTPUT_PREFIX = os.environ.get('OUTPUT_PREFIX', 'processed/') 
+OUTPUT_PREFIX = os.environ.get('OUTPUT_PREFIX', 'processed/')
+LITELLM_PROXY_URL = os.environ.get('LITELLM_PROXY_URL')
+DB_SECRET_NAME = os.environ.get('DB_SECRET_NAME')
 
+# --- SHARED CLIENTS (Initialized once per container) ---
+client = OpenAI(
+    base_url=f"{LITELLM_PROXY_URL}/v1",
+    api_key="not-needed"
+)
+db_creds = None
+conn = None
+
+# --- LOGGING SETUP ---
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+
+# --- HELPER FUNCTIONS ---
 
 def parse_s3_url(s3_url):
     """Extract bucket and key from s3:// URL"""
     parsed = urlparse(s3_url)
     return parsed.netloc, parsed.path.lstrip('/')
 
-def lambda_handler(event: dict, context):
-    logger.info(f"Received event: {json.dumps(event)}")
-    
+def extract_json_from_string(text: str) -> str:
+    """Uses regex to find and extract the first valid JSON object from a string."""
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return match.group(0)
+    return ""
+
+# --- DATABASE FUNCTIONS ---
+
+def get_db_credentials():
+    """Retrieves database credentials from AWS Secrets Manager."""
+    global db_creds
+    if db_creds is None:
+        response = secrets_client.get_secret_value(SecretId=DB_SECRET_NAME)
+        db_creds = json.loads(response['SecretString'])
+    return db_creds
+
+def get_db_connection():
+    """Establishes or returns an active database connection."""
+    global conn
+    if conn is None or conn.closed:
+        creds = get_db_credentials()
+        conn = psycopg2.connect(
+            host=creds['host'],
+            port=creds['port'],
+            database=creds['dbname'],
+            user=creds['username'],
+            password=creds['password']
+        )
+        logger.info("Successfully connected to the database.")
+    return conn
+
+def update_indexing_status(file_id, status, db_conn):
+    """Updates the file's indexing status in the database."""
+    logger.info(f"Updating status for file '{file_id}' to '{status}'")
     try:
-        # 1. Parse Input
-        if 'body' in event and isinstance(event['body'], str):
-            body = json.loads(event['body'])
-        else:
-            body = event
+        with db_conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE files 
+                SET indexing_status = %s, updated_at = NOW()
+                WHERE id = %s;
+                """,
+                (status, file_id)
+            )
+            db_conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to update indexing status for file '{file_id}': {e}")
+        db_conn.rollback()
 
-        s3_url = body.get('s3Url')
-        case_id = body.get('caseId') # Get Case ID
+
+# --- MAIN LAMBDA HANDLER ---
+def lambda_handler(event: dict, context):
+    logger.info(f"Received SQS event to process document: {json.dumps(event)}")
+    
+    # 1. PARSE INCOMING SQS MESSAGE
+    try:
+        message_body = json.loads(event['Records'][0]['body'])
+        file_id = message_body['fileId']
+        case_id = message_body['caseId']
+        bucket_name = message_body['s3Bucket']
+        object_key = message_body['s3Key']
+        s3_url = f"s3://{bucket_name}/{object_key}"
+    except (KeyError, IndexError) as e:
+        logger.error(f"Malformed SQS message. Error: {e}")
+        return {'statusCode': 200, 'body': 'Malformed SQS message'}
+
+    # FIX: Initialize db_conn to None before the try block
+    db_conn = None
+    try:
+        # FIX: Establish DB connection first and use the local variable db_conn
+        db_conn = get_db_connection()
+        # FIX: Corrected arguments and using a more accurate initial status
+        update_indexing_status(file_id, 'CHUNKING STARTED', db_conn)
         
-        # Validate Inputs
-        if not s3_url:
-            return {'statusCode': 400, 'body': json.dumps({'error': 'Missing s3Url parameter'})}
-        
-        if not case_id:
-            return {'statusCode': 400, 'body': json.dumps({'error': 'Missing caseId parameter'})}
+        logger.info(f"Starting processing for FileId: {file_id}, CaseId: {case_id}")
 
-        bucket_name, object_key = parse_s3_url(s3_url)
-        logger.info(f"Processing Case: {case_id} | Document: {object_key}")
-
-        # 2. Download File from S3
+        # 2. DOWNLOAD FILE FROM S3
         response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
         file_bytes = response['Body'].read()
-        logger.info(f"Downloaded {len(file_bytes)} bytes")
+        logger.info(f"Downloaded {len(file_bytes)} bytes from {s3_url}")
 
-        # 3. Process Document (Parsing)
-        is_image_present = body.get('isImagePresent', False)
+        # 3. VLM DOCUMENT RECONSTRUCTION
+        parser = VlmDocParser(bytes_content=file_bytes, vlm_proxy_url=LITELLM_PROXY_URL)
+        vlm_doc = parser.reconstruct_document()
+
+        # 4. VLM-POWERED METADATA EXTRACTION
+        logger.info("Starting metadata extraction from VLM-reconstructed text...")
+        extraction_prompt = textwrap.dedent("""
+            From the document text provided, extract the following:
+            - "document_title": The primary title.
+            - "summary": A concise, one to three-sentence summary.
+            - "document_date": The date the document is created.
+            - "important_dates": [{...}] A list of dates with their descriptions. 
+            Respond ONLY with a valid JSON object.
+        """) # Your detailed prompt here
         
-        parser = DoclingParser(
-            bytes_content=file_bytes,
-            is_image_present=is_image_present,
-            is_md_response=False 
+        # FIX: Use the alias from your LiteLLM config, not the full model ID
+        response = client.chat.completions.create(
+            model="us.amazon.nova-2-lite-v1:0",
+            messages=[{"role": "user", "content": f"{extraction_prompt}\n\nDOCUMENT_TEXT:\n{vlm_doc.export_to_markdown()}"}],
+            temperature=0.0
         )
+        response_text = response.choices[0].message.content
+        json_string = extract_json_from_string(response_text)
+        if not json_string:
+            raise ValueError(f"Could not find any JSON in the VLM response. Raw response was: {response_text}")
         
-        logger.info(f"Detected document type: {parser.doc_type}")
-        
-        conversion_result = parser.parse_documents()
-        doc = conversion_result.document
+        extracted_metadata = json.loads(json_string)
+        logger.info(f"Extracted metadata: {json.dumps(extracted_metadata)}")
 
-        # 4. Hybrid Chunking
-        chunker = HybridChunker(merge_peers=True)
-        chunk_iter = chunker.chunk(dl_doc=doc)
+        # 5. HYBRID CHUNKING
+        logger.info("Starting document chunking...")
+        # IMPROVEMENT: Set max_tokens to get your desired larger chunk size
+        chunker = HybridChunker(merge_peers=True, max_tokens=1024)
+        chunk_iter = chunker.chunk(dl_doc=vlm_doc)
         
         output_chunks = []
         for i, chunk in enumerate(chunk_iter):
             serialized_text = chunker.serialize(chunk)
-            if not serialized_text.strip(): continue
+            if not serialized_text.strip():
+                continue
 
+            # Extract page numbers from the chunk's provenance data
             page_numbers = sorted(list(set(
-                prov.page_no for item in chunk.meta.doc_items 
+                prov.page_no
+                for item in chunk.meta.doc_items
                 for prov in item.prov if hasattr(prov, "page_no")
             )))
-            
-            bboxes = []
-            for item in chunk.meta.doc_items:
-                 for prov in item.prov:
-                     if hasattr(prov, "bbox") and prov.bbox:
-                         bboxes.append(prov.bbox.as_tuple())
 
+            # Extract bounding boxes for potential UI highlighting
+            bboxes = [
+                prov.bbox.as_tuple()
+                for item in chunk.meta.doc_items
+                for prov in item.prov if hasattr(prov, "bbox") and prov.bbox
+            ]
+
+            # Assemble the final chunk object
             output_chunks.append({
                 "chunk_id": i,
                 "text": serialized_text,
                 "metadata": {
                     "page_numbers": page_numbers,
                     "bboxes": bboxes,
-                    "doc_items": [str(item.self_ref) for item in chunk.meta.doc_items]
+                    # This cleanly merges the document-level metadata into each chunk
+                    **extracted_metadata
                 }
             })
+        logger.info(f"Generated {len(output_chunks)} chunks.")
 
-        # 5. Prepare Output Content
-        markdown_content = doc.export_to_markdown()
+        # 6. UPLOAD PROCESSED ARTIFACTS TO S3
         chunks_content = json.dumps(output_chunks, indent=2)
         
-        # 6. Upload Results to S3
-        # Logic: processed/case_123/filename/filename.md
         base_name = os.path.basename(object_key)
         name_only = os.path.splitext(base_name)[0]
+        target_folder = f"{OUTPUT_PREFIX}{case_id}/{name_only}"
         
-        # Construct the specific folder path for this case and document
-        # Ensure OUTPUT_PREFIX ends with / if it exists, or handle empty string
-        prefix = OUTPUT_PREFIX if OUTPUT_PREFIX.endswith('/') else f"{OUTPUT_PREFIX}/"
-        target_folder = f"{prefix}{case_id}/{name_only}"
-        
-        md_key = f"{target_folder}/{name_only}.md"
         json_key = f"{target_folder}/{name_only}_chunks.json"
+        # FIX: Added md_key for the markdown file
         meta_key = f"{target_folder}/metadata.json"
         
-        # Upload Markdown
-        s3_client.put_object(
-            Bucket=bucket_name,
-            Key=md_key,
-            Body=markdown_content,
-            ContentType='text/markdown'
-        )
-        
-        # Upload Chunks JSON
-        s3_client.put_object(
-            Bucket=bucket_name,
-            Key=json_key,
-            Body=chunks_content,
-            ContentType='application/json'
-        )
+        s3_client.put_object(Bucket=bucket_name, Key=json_key, Body=chunks_content, ContentType='application/json')
+        logger.info(f"Uploaded processed artifacts to S3 folder: {target_folder}")
 
-        logger.info(f"Uploaded results to {target_folder}")
-
-        # 7. Create Metadata Payload & Send to SQS
-        metadata_payload = {
-            "case_id": case_id,
-            "original_document": f"s3://{bucket_name}/{object_key}",
-            "processed_markdown": f"s3://{bucket_name}/{md_key}",
+        # 7. CREATE FINAL METADATA PAYLOAD & SEND SQS NOTIFICATION
+        final_metadata_payload = {
+            "caseId": case_id, "fileId": file_id, "original_document": s3_url,
             "processed_chunks": f"s3://{bucket_name}/{json_key}",
-            "document_metadata": {
-                "page_count": doc.page_count,
-                "name": doc.name,
-                "chunk_count": len(output_chunks)
-            },
+            "document_info": {"page_count": len(vlm_doc.pages), "chunk_count": len(output_chunks)},
             "status": "success"
         }
+        s3_client.put_object(Bucket=bucket_name, Key=meta_key, Body=json.dumps(final_metadata_payload, indent=2))
 
-        # Save metadata.json to S3
-        s3_client.put_object(
-            Bucket=bucket_name,
-            Key=meta_key,
-            Body=json.dumps(metadata_payload, indent=2),
-            ContentType='application/json'
-        )
-
-        # Send to SQS
         if SQS_QUEUE_URL:
-            sqs_client.send_message(
-                QueueUrl=SQS_QUEUE_URL,
-                MessageBody=json.dumps(metadata_payload)
-            )
-            logger.info("Sent metadata to SQS")
-        else:
-            logger.warning("SQS_QUEUE_URL not set, skipping queue push")
+            sqs_client.send_message(QueueUrl=SQS_QUEUE_URL, MessageBody=json.dumps(final_metadata_payload))
+            logger.info(f"Sent completion message to SQS for fileId {file_id}")
+        
+        # FIX: Use the correct status and the local db_conn variable
+        update_indexing_status(file_id, 'CHUNKING COMPLETE', db_conn)
 
-        return {
-            'statusCode': 200,
-            'body': json.dumps(metadata_payload)
-        }
+        return {'statusCode': 200, 'body': json.dumps(final_metadata_payload)}
 
     except Exception as e:
         stack_trace = traceback.format_exc()
-        logger.error(f"Error: {str(e)}\n{stack_trace}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': str(e), 'trace': stack_trace})
-        }
+        logger.error(f"FATAL ERROR processing fileId {file_id}: {str(e)}\n{stack_trace}")
+        
+        # FIX: Update status to FAILED on any error
+        if db_conn:
+            update_indexing_status(file_id, 'FAILED', db_conn)
+            
+        raise e
+        
+    finally:
+        # FIX: CRITICAL - Always close the database connection
+        global conn
+        if conn and not conn.closed:
+            conn.close()
+            logger.info("Database connection closed.")
