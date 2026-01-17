@@ -133,19 +133,43 @@ def lambda_handler(event: dict, context):
         # 4. VLM-POWERED METADATA EXTRACTION
         logger.info("Starting metadata extraction from VLM-reconstructed text...")
         extraction_prompt = textwrap.dedent("""
-            From the document text provided, extract the following:
-            - "document_title": The primary title.
-            - "summary": A concise, one to three-sentence summary.
-            - "document_date": The date the document is created.
-            - "important_dates": [{...}] A list of dates with their descriptions. 
-            Respond ONLY with a valid JSON object.
+            You are an expert legal AI assistant specializing in personal injury law. 
+            Your task is to analyze a case document and extract a comprehensive set of metadata in a structured JSON format. 
+            Analyze the text provided and populate all relevant fields from the following schema. 
+            If a field is not applicable or the information is not present, use null.
+                                            
+            JSON Schema to populate:
+             {  "document_type": "Categorize the document (e.g., 'Medical Record', 'Police Accident Report', 'Insurance Correspondence')",
+                "document_title": "The document's title", 
+                "document_date": "The date the document was created (YYYY-MM-DD)", 
+                "summary": "A 2-3 sentence summary of the document", 
+                "entities": [ { "name": "Entity Name", "role": "Entity Role (e.g., Patient, Provider, Insurance Adjuster)", 
+                "contact_info": "Any contact details", "policy_or_claim_number": "Associated ID numbers" } ], 
+                "primary_date": "The main date of service or event (YYYY-MM-DD)", 
+                "all_dates_mentioned": [ { "date": "YYYY-MM-DD", "description": "Context of the date" } ], 
+                "event_description": "A narrative description of the document's main event", 
+                "financial_summary": { "invoice_number": null, "service_date_range": null, "billed_amount": 0.0, "paid_amount": 0.0, "adjustments": 0.0, "outstanding_balance": 0.0, "is_lien": false }, 
+                "causation_statements": [ "List of quotes linking injury to the incident" ], 
+                "liability_indicators": [ "List of quotes related to fault" ], 
+                "damages_evidence": [ { "type": "Category of damage (e.g., Pain and Suffering)", "quote_or_finding": "The supporting text" } ], 
+                                    "prognosis_and_permanency": [ "List of quotes about the patient's future outlook" ],
+                "clinical_breakdown": {
+                    "subjective": "Patient complaints and history",
+                    "objective": "Physical exam findings, test results, and observations",
+                    "assessment": "Diagnoses and medical conclusions",
+                    "plan": "Treatments, prescriptions, and follow-ups"
+                }
+            }
+
+            Return only the JSON object.
         """) # Your detailed prompt here
         
         # FIX: Use the alias from your LiteLLM config, not the full model ID
         response = client.chat.completions.create(
             model="us.amazon.nova-2-lite-v1:0",
             messages=[{"role": "user", "content": f"{extraction_prompt}\n\nDOCUMENT_TEXT:\n{vlm_doc.export_to_markdown()}"}],
-            temperature=0.0
+            temperature=0.0,
+            max_tokens=8192
         )
         response_text = response.choices[0].message.content
         json_string = extract_json_from_string(response_text)

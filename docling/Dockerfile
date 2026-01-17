@@ -18,7 +18,8 @@ ENV HF_HOME=/tmp/huggingface
 
 RUN docling-tools models download-hf-repo sentence-transformers/all-MiniLM-L6-v2
 # Copy the rest of the application code
-COPY docling/ ${LAMBDA_TASK_ROOT}/
+COPY docling/lambda_function.py ${LAMBDA_TASK_ROOT}/
+COPY docling/docling_parser.py ${LAMBDA_TASK_ROOT}/
 
 # Set the entry point for the Lambda function
 CMD ["lambda_function.lambda_handler"]
